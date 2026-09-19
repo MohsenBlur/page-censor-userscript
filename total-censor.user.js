@@ -1,14 +1,19 @@
 // ==UserScript==
-// @name         Total Censor - jumble all text, checkerboard all images
+// @name         Total Censor - jumble all text, blank out all images
 // @namespace    total-censor
-// @version      1.0.0
-// @description  Replaces every visible letter/digit with a random one, and paints every image, video, canvas, SVG and CSS background with a checkerboard. Keeps working on dynamically added content. Toggle with Ctrl+Alt+C, re-jumble with Ctrl+Alt+R.
+// @version      1.2.0
+// @description  Off until you switch it on for a site from the userscript manager's menu. Then it replaces every visible letter/digit with a random one and swaps every image, video, canvas, SVG and CSS background for a blank placeholder, on that domain, for as long as you leave it on.
 // @author       you
 // @match        *://*/*
 // @match        file:///*
 // @run-at       document-start
 // @all-frames   true
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
 // ==/UserScript==
 
 (function () {
@@ -17,7 +22,10 @@
   /* =============================== config =============================== */
 
   const CONFIG = {
-    startEnabled: true,
+    // Off everywhere until you switch a site on from the userscript manager's menu.
+    // That choice is remembered per domain, so the site comes up censored next time.
+    defaultOn: false,           // true = censor every site unless switched off
+    rememberPerSite: true,      // false = the menu toggle lasts only for this page load
     skipHosts: [],              // hostnames to leave alone, e.g. ['mail.google.com']
 
     text: {
@@ -43,7 +51,17 @@
       favicon: true,
     },
 
-    checker: { size: 14, light: '#d8d8d8', dark: '#8a8a8a' },
+    // What stands in for an image: a flat panel with its own hairline outline, so two
+    // images side by side still read as two images, plus a small photo mark on anything
+    // big enough to carry one.
+    placeholder: {
+      fill: '#edeff1',
+      edge: 'rgba(0, 0, 0, 0.26)',
+      glyph: '#98a0a8',
+      showGlyph: true,                  // skipped automatically on small images
+      pattern: 'none',                  // 'none', or 'checker' for the louder look
+      checker: { size: 14, light: '#d8d8d8', dark: '#8a8a8a' },
+    },
 
     hideUntilCensored: true,    // blank the page until the first pass finishes (no flash)
     revealFailsafeMs: 3000,
@@ -55,7 +73,51 @@
     },
   };
 
-  if (CONFIG.skipHosts.indexOf(location.hostname) !== -1) return;
+  /* ========================= which site are we on ========================= */
+
+  // Frames are keyed by the hostname of the top-level page, not their own, so that
+  // switching a site on also covers the ad/embed/widget frames inside it.
+  function siteHost() {
+    if (window.top === window.self) return location.hostname || location.protocol;
+    try {
+      const chain = location.ancestorOrigins;
+      if (chain && chain.length) {
+        const host = new URL(chain[chain.length - 1]).hostname;   // outermost = top
+        if (host) return host;
+      }
+    } catch (e) {}
+    try {
+      if (window.top.location.hostname) return window.top.location.hostname;
+    } catch (e) {}   // cross-origin and no ancestorOrigins (Firefox): fall back to our own
+    return location.hostname || location.protocol;
+  }
+
+  const SITE = siteHost();
+  const SITE_KEY = 'censor-site:' + SITE;
+
+  if (CONFIG.skipHosts.indexOf(SITE) !== -1) return;
+
+  // Tampermonkey and Violentmonkey give us synchronous storage; Greasemonkey 4 only
+  // has the async GM.* API; a plain console paste has neither.
+  const gmSync = (typeof GM_getValue === 'function' && typeof GM_setValue === 'function');
+  const gmAsync = (typeof GM !== 'undefined' && GM && typeof GM.getValue === 'function') ? GM : null;
+
+  function storeGet(key) {     // a value, a promise, or undefined when never set
+    try {
+      if (gmSync) return GM_getValue(key, undefined);
+      if (gmAsync) return gmAsync.getValue(key, undefined);
+      const raw = localStorage.getItem(key);
+      return raw === null ? undefined : raw === 'true';
+    } catch (e) { return undefined; }
+  }
+
+  function storeSet(key, val) {
+    try {
+      if (gmSync) { GM_setValue(key, val); return; }
+      if (gmAsync) { gmAsync.setValue(key, val); return; }
+      localStorage.setItem(key, String(val));
+    } catch (e) {}
+  }
 
   /* =============================== state =============================== */
 
@@ -139,66 +201,133 @@
     return out;
   }
 
-  /* ============================== checkerboard ============================== */
+  /* ============================== placeholders ============================== */
 
-  const svgCache = new Map();
+  const uriCache = new Map();
 
-  function checkerURI(w, h) {
-    w = Math.max(1, Math.min(4000, Math.round(w)));
-    h = Math.max(1, Math.min(4000, Math.round(h)));
-    const key = w + 'x' + h;
-    let uri = svgCache.get(key);
+  // A photo mark on a 24x24 grid: frame, sun, horizon.
+  const GLYPH_PATHS =
+    '<rect x="2.5" y="4.5" width="19" height="15" rx="2"/>' +
+    '<circle cx="8.5" cy="10" r="1.8"/>' +
+    '<path d="M3 17.5l5.5-5 3.5 3.5 3.5-3.5 5.5 5"/>';
+
+  // The mark on its own, for elements we style instead of handing an <img> src.
+  // background-size caps it, and the viewBox keeps it square inside a non-square box.
+  function glyphURI() {
+    let uri = uriCache.get('glyph');
     if (uri) return uri;
-
-    const s = CONFIG.checker.size;
-    const svg =
-      '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
-      '<defs><pattern id="c" width="' + (s * 2) + '" height="' + (s * 2) + '" patternUnits="userSpaceOnUse">' +
-      '<rect width="' + (s * 2) + '" height="' + (s * 2) + '" fill="' + CONFIG.checker.light + '"/>' +
-      '<rect width="' + s + '" height="' + s + '" fill="' + CONFIG.checker.dark + '"/>' +
-      '<rect x="' + s + '" y="' + s + '" width="' + s + '" height="' + s + '" fill="' + CONFIG.checker.dark + '"/>' +
-      '</pattern></defs><rect width="100%" height="100%" fill="url(#c)"/></svg>';
-
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" ' +
+      'fill="none" stroke="' + CONFIG.placeholder.glyph + '" stroke-width="0.9" ' +
+      'stroke-linejoin="round" stroke-linecap="round">' + GLYPH_PATHS + '</svg>';
     uri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-    if (svgCache.size < 400) svgCache.set(key, uri);
+    uriCache.set('glyph', uri);
     return uri;
   }
 
+  // Never wider than 40px, never more than 45% of the box, so it fits a hero banner
+  // and a 20px icon alike.
+  const GLYPH_SIZE = 'min(40px, 45%) min(40px, 45%)';
+
   function checkerGradient() {
-    const d = CONFIG.checker.dark;
+    const d = CONFIG.placeholder.checker.dark;
     return 'linear-gradient(45deg, ' + d + ' 25%, transparent 25%, transparent 75%, ' + d + ' 75%, ' + d + ')';
   }
 
-  function checkerCSS() {
-    const s = CONFIG.checker.size;
-    const g = checkerGradient();
-    return {
-      'background-image': g + ', ' + g,
-      'background-size': (s * 2) + 'px ' + (s * 2) + 'px',
-      'background-position': '0 0, ' + s + 'px ' + s + 'px',
-      'background-repeat': 'repeat',
-      'background-color': CONFIG.checker.light,
+  // The stand-in image, drawn at the exact pixel size of what it replaces: panel,
+  // optional photo mark, and a hairline outline last so it sits on top of everything.
+  function placeholderURI(w, h) {
+    w = Math.max(1, Math.min(4000, Math.round(w)));
+    h = Math.max(1, Math.min(4000, Math.round(h)));
+    const key = w + 'x' + h;
+    const cached = uriCache.get(key);
+    if (cached) return cached;
+
+    const p = CONFIG.placeholder;
+    let defs = '';
+    let body;
+
+    if (p.pattern === 'checker') {
+      const s = p.checker.size;
+      defs = '<defs><pattern id="c" width="' + (s * 2) + '" height="' + (s * 2) + '" patternUnits="userSpaceOnUse">' +
+        '<rect width="' + (s * 2) + '" height="' + (s * 2) + '" fill="' + p.checker.light + '"/>' +
+        '<rect width="' + s + '" height="' + s + '" fill="' + p.checker.dark + '"/>' +
+        '<rect x="' + s + '" y="' + s + '" width="' + s + '" height="' + s + '" fill="' + p.checker.dark + '"/>' +
+        '</pattern></defs>';
+      body = '<rect width="100%" height="100%" fill="url(#c)"/>';
+    } else {
+      body = '<rect width="100%" height="100%" fill="' + p.fill + '"/>';
+    }
+
+    const min = Math.min(w, h);
+    if (p.showGlyph && min >= 44) {
+      const g = Math.max(20, Math.min(56, min * 0.3));
+      const k = g / 24;                        // the mark is drawn on a 24x24 grid
+      const sw = (1.5 / k).toFixed(2);         // keeps the stroke ~1.5px at any size
+      body +=
+        '<g transform="translate(' + ((w - g) / 2).toFixed(1) + ' ' + ((h - g) / 2).toFixed(1) +
+        ') scale(' + k.toFixed(4) + ')" fill="none" stroke="' + p.glyph + '" stroke-width="' + sw +
+        '" stroke-linejoin="round" stroke-linecap="round">' + GLYPH_PATHS + '</g>';
+    }
+
+    body += '<rect x="0.5" y="0.5" width="' + (w - 1) + '" height="' + (h - 1) +
+            '" fill="none" stroke="' + p.edge + '" stroke-width="1"/>';
+
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h +
+                '" viewBox="0 0 ' + w + ' ' + h + '">' + defs + body + '</svg>';
+    const uri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    if (uriCache.size < 400) uriCache.set(key, uri);
+    return uri;
+  }
+
+  // For everything we cannot hand an <img> src to: CSS backgrounds, masked icons,
+  // inline SVG, video, canvas. The inset shadow draws the same hairline edge at
+  // whatever size the element turns out to be.
+  // `withGlyph` is for elements that stood in for a picture — inline SVG, canvas.
+  // Plain CSS backgrounds skip it: most of them are texture and sprite icons, and a
+  // mark on every one of those is noise.
+  function panelCSS(withGlyph) {
+    const p = CONFIG.placeholder;
+    const glyph = (withGlyph && p.showGlyph) ? 'url("' + glyphURI() + '")' : null;
+    const css = {
+      'background-color': p.fill,
+      'box-shadow': 'inset 0 0 0 1px ' + p.edge,
       'background-attachment': 'scroll',
       'background-origin': 'padding-box',
       'background-clip': 'border-box',
     };
+
+    if (p.pattern === 'checker') {
+      const s = p.checker.size;
+      const g = checkerGradient();
+      const tile = (s * 2) + 'px ' + (s * 2) + 'px';
+      css['background-color'] = p.checker.light;
+      css['background-image'] = (glyph ? glyph + ', ' : '') + g + ', ' + g;
+      css['background-size'] = (glyph ? GLYPH_SIZE + ', ' : '') + tile + ', ' + tile;
+      css['background-position'] = (glyph ? 'center center, ' : '') + '0 0, ' + s + 'px ' + s + 'px';
+      css['background-repeat'] = (glyph ? 'no-repeat, ' : '') + 'repeat, repeat';
+    } else if (glyph) {
+      css['background-image'] = glyph;    // replacing background-image is what hides the original
+      css['background-size'] = GLYPH_SIZE;
+      css['background-position'] = 'center center';
+      css['background-repeat'] = 'no-repeat';
+    } else {
+      css['background-image'] = 'none';
+      css['background-repeat'] = 'repeat';
+    }
+    return css;
   }
 
-  function paintCanvas(cv) {
+  // A canvas is wiped rather than painted on, so the panel behind it shows through and
+  // the page is free to keep drawing into a surface that stays blank.
+  function blankCanvas(cv) {
     let ctx;
     try { ctx = cv.getContext('2d'); } catch (e) { ctx = null; }
     if (!ctx) return false;
-    const s = CONFIG.checker.size;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = CONFIG.checker.light;
-    ctx.fillRect(0, 0, cv.width, cv.height);
-    ctx.fillStyle = CONFIG.checker.dark;
-    for (let y = 0, row = 0; y < cv.height; y += s, row++) {
-      for (let x = (row % 2) * s; x < cv.width; x += s * 2) ctx.fillRect(x, y, s, s);
-    }
+    ctx.clearRect(0, 0, cv.width, cv.height);
     ctx.restore();
     return true;
   }
@@ -340,10 +469,15 @@
     const finish = () => {
       if (!enabled || !r.imgPending) return;
       r.imgPending = false;
+      // Draw at the size the image is actually displayed at, so the outline stays a
+      // crisp 1px and the mark keeps its proportions. A thumbnail shrunk from a large
+      // original would otherwise get a hairline scaled down to nothing, which is exactly
+      // when neighbouring images start to look like one image. Falling back to the
+      // intrinsic size keeps the aspect ratio right when there is no layout yet.
       const box = el.getBoundingClientRect();
-      const w = el.naturalWidth || el.width || box.width || 320;
-      const h = el.naturalHeight || el.height || box.height || 200;
-      r.appliedSrc = checkerURI(w, h);
+      const w = Math.round(box.width) || el.naturalWidth || el.width || 320;
+      const h = Math.round(box.height) || el.naturalHeight || el.height || 200;
+      r.appliedSrc = placeholderURI(w, h);
       el.removeAttribute('srcset');
       el.removeAttribute('sizes');
       el.setAttribute('src', r.appliedSrc);
@@ -378,7 +512,7 @@
     if (r.svg) return;
     r.svg = true;
     el.setAttribute('data-censored-svg', '');   // the stylesheet hides its children
-    setStyles(el, checkerCSS());
+    setStyles(el, panelCSS(true));
   }
 
   function censorVideo(el) {
@@ -402,16 +536,16 @@
     el.autoplay = false;
     el.removeAttribute('src');
     try { el.load(); } catch (e) {}
-    el.setAttribute('poster', checkerURI(w, h));   // a source-less video renders its poster
-    setStyles(el, checkerCSS());
+    el.setAttribute('poster', placeholderURI(w, h));   // a source-less video renders its poster
+    setStyles(el, panelCSS());
   }
 
   function censorCanvas(el) {
     const r = rec(el);
     if (r.canvas) return;
     r.canvas = true;
-    if (paintCanvas(el)) {
-      setStyles(el, checkerCSS());
+    if (blankCanvas(el)) {
+      setStyles(el, panelCSS(true));
       if (CONFIG.media.canvasRepaintMs > 0) canvasLog.push(el);
     } else {
       // WebGL or a context we cannot grab: hiding it is the only reliable cover
@@ -420,21 +554,25 @@
     }
   }
 
-  const IFRAME_DOC =
-    '<!doctype html><meta charset="utf-8"><style>html,body{margin:0;height:100%}' +
-    'body{background-color:LIGHT;background-image:GRAD,GRAD;background-size:SZpx SZpx;' +
-    'background-position:0 0,HSpx HSpx}</style>';
+  function iframeDoc() {
+    const p = CONFIG.placeholder;
+    let bg = 'background-color:' + p.fill;
+    if (p.pattern === 'checker') {
+      const s = p.checker.size;
+      const g = checkerGradient();
+      bg = 'background-color:' + p.checker.light + ';background-image:' + g + ',' + g +
+           ';background-size:' + (s * 2) + 'px ' + (s * 2) + 'px' +
+           ';background-position:0 0,' + s + 'px ' + s + 'px';
+    }
+    return '<!doctype html><meta charset="utf-8"><style>html,body{margin:0;height:100%}' +
+           'body{' + bg + ';box-sizing:border-box;border:1px solid ' + p.edge + '}</style>';
+  }
 
   function censorIframe(el) {
     const r = rec(el);
     if (r.iframe) return;
     r.iframe = { src: el.getAttribute('src'), srcdoc: el.getAttribute('srcdoc') };
-    const s = CONFIG.checker.size;
-    el.setAttribute('srcdoc', IFRAME_DOC
-      .replace(/GRAD/g, checkerGradient())
-      .replace(/LIGHT/g, CONFIG.checker.light)
-      .replace(/SZ/g, String(s * 2))
-      .replace(/HS/g, String(s)));
+    el.setAttribute('srcdoc', iframeDoc());
     el.removeAttribute('src');
   }
 
@@ -456,7 +594,7 @@
     if (!bg && !mask) return;
 
     rec(el).bg = true;
-    const props = checkerCSS();
+    const props = panelCSS();
     if (mask) {
       props['mask-image'] = 'none';
       props['-webkit-mask-image'] = 'none';
@@ -466,7 +604,7 @@
 
   function censorFavicon() {
     if (!CONFIG.media.favicon || !document.head) return;
-    const uri = checkerURI(64, 64);
+    const uri = placeholderURI(64, 64);
     let found = false;
     for (const link of Array.from(document.querySelectorAll('link[rel]'))) {
       if (!/\bicon\b/i.test(link.getAttribute('rel') || '')) continue;
@@ -575,7 +713,7 @@
 
   function injectGlobalCSS() {
     if (globalStyle) return;
-    const s = CONFIG.checker.size;
+    const s = CONFIG.placeholder.checker.size;
     const g = checkerGradient();
     let css =
       '[data-censored-svg] > * { visibility: hidden !important; }\n';
@@ -617,10 +755,12 @@
 
   /* ============================== enable / disable ============================== */
 
-  function enable() {
+  // `initial` = we are censoring from page load, so blank the page until the first
+  // pass lands. Switching it on by hand later has nothing to hide from.
+  function enable(initial) {
     if (enabled) return;
     enabled = true;
-    setHidden(true);
+    if (initial) setHidden(true);
     injectGlobalCSS();
 
     observer = new MutationObserver(onMutations);
@@ -639,7 +779,7 @@
         for (let i = canvasLog.length - 1; i >= 0; i--) {
           const cv = canvasLog[i];
           if (!cv.isConnected) { canvasLog.splice(i, 1); continue; }
-          paintCanvas(cv);
+          blankCanvas(cv);
         }
       }, CONFIG.media.canvasRepaintMs);
     }
@@ -735,10 +875,48 @@
     }
   }
 
+  /* ========================= the per-site switch ========================= */
+
+  // Applies a state without touching storage. Used by the storage listener so other
+  // tabs and frames on the same site follow along.
+  function applyState(on, initial) {
+    if (on === enabled) return;
+    if (on) enable(initial); else disable();
+    registerMenu();
+  }
+
   function toggle() {
-    if (enabled) disable(); else enable();
-    toast(enabled ? 'Censored' : 'Uncensored');
-    return enabled;
+    const next = !enabled;
+    applyState(next, false);
+    if (CONFIG.rememberPerSite) storeSet(SITE_KEY, next);
+    toast(next ? ('Censoring ' + SITE) : ('Uncensored ' + SITE));
+    return next;
+  }
+
+  let menuIds = [];
+  function registerMenu() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+    if (window.top !== window.self) return;   // one set of menu entries, not one per frame
+    if (typeof GM_unregisterMenuCommand === 'function') {
+      for (const id of menuIds) { try { GM_unregisterMenuCommand(id); } catch (e) {} }
+      menuIds = [];
+    } else if (menuIds.length) {
+      return;   // no way to replace the old entries, so leave the first ones in place
+    }
+    menuIds.push(GM_registerMenuCommand(
+      enabled ? ('■ Stop censoring ' + SITE) : ('▶ Censor ' + SITE), toggle));
+    if (enabled) {
+      menuIds.push(GM_registerMenuCommand('↻ Re-jumble', rescramble));
+    }
+  }
+
+  // Keep every tab and frame on this site in step with the switch.
+  if (typeof GM_addValueChangeListener === 'function') {
+    try {
+      GM_addValueChangeListener(SITE_KEY, (name, oldVal, newVal) => {
+        applyState(newVal === undefined ? CONFIG.defaultOn : !!newVal, false);
+      });
+    } catch (e) {}
   }
 
   /* ============================== tiny ui ============================== */
@@ -771,38 +949,52 @@
   }
 
   window.addEventListener('keydown', (e) => {
-    if (matches(e, CONFIG.keys.toggle)) { e.preventDefault(); toggle(); }
-    else if (matches(e, CONFIG.keys.rescramble)) { e.preventDefault(); rescramble(); toast('Re-jumbled'); }
+    if (matches(e, CONFIG.keys.toggle)) {
+      e.preventDefault();
+      toggle();
+    } else if (matches(e, CONFIG.keys.rescramble) && enabled) {
+      e.preventDefault();
+      rescramble();
+      toast('Re-jumbled');
+    }
   }, true);
 
-  if (typeof GM_registerMenuCommand === 'function') {
-    GM_registerMenuCommand('Toggle censorship (Ctrl+Alt+C)', toggle);
-    GM_registerMenuCommand('Re-jumble text (Ctrl+Alt+R)', rescramble);
-  }
-
-  // debug / scripting handle
-  try {
-    Object.defineProperty(window, '__censor', {
-      value: {
-        toggle: toggle, enable: enable, disable: disable, rescramble: rescramble,
-        scramble: scramble, CONFIG: CONFIG,
-        get enabled() { return enabled; },
-      },
-      configurable: true,
-    });
-  } catch (e) {}
+  // debug / scripting handle. Defined on the page window too, where the console can
+  // reach it; under a sandbox that write may be refused, which is not worth caring about.
+  (function exposeHandle() {
+    const api = {
+      toggle: toggle, enable: enable, disable: disable, rescramble: rescramble,
+      scramble: scramble, CONFIG: CONFIG, site: SITE,
+      get enabled() { return enabled; },
+    };
+    const targets = [window];
+    if (typeof unsafeWindow !== 'undefined' && unsafeWindow) targets.push(unsafeWindow);
+    for (const t of targets) {
+      try { Object.defineProperty(t, '__censor', { value: api, configurable: true }); } catch (e) {}
+    }
+  })();
 
   /* ============================== boot ============================== */
 
-  if (CONFIG.startEnabled) {
-    enable();
-    // Late passes catch anything that slipped past the observer, plus images and
-    // stylesheet-driven backgrounds that only resolve once the page has loaded.
-    document.addEventListener('DOMContentLoaded', () => {
-      if (enabled) { walk(document.documentElement); censorFavicon(); }
-    });
-    window.addEventListener('load', () => {
-      if (enabled) { walk(document.documentElement); censorFavicon(); }
-    });
+  // Late passes catch anything that slipped past the observer, plus images and
+  // stylesheet-driven backgrounds that only resolve once the page has loaded.
+  document.addEventListener('DOMContentLoaded', () => {
+    if (enabled) { walk(document.documentElement); censorFavicon(); }
+  });
+  window.addEventListener('load', () => {
+    if (enabled) { walk(document.documentElement); censorFavicon(); }
+  });
+
+  function start(stored) {
+    applyState(stored === undefined || stored === null ? CONFIG.defaultOn : !!stored, true);
+    registerMenu();   // applyState only re-registers when the state actually changed
+  }
+
+  const stored = CONFIG.rememberPerSite ? storeGet(SITE_KEY) : undefined;
+  if (stored && typeof stored.then === 'function') {
+    // Greasemonkey 4: we only learn the answer after the page has started drawing
+    stored.then(start, () => start(undefined));
+  } else {
+    start(stored);
   }
 })();

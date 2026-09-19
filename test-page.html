@@ -15,6 +15,9 @@
   .row > * { flex: 0 0 auto; }
   .row { display: flex; gap: 16px; align-items: flex-start; margin: 14px 0; }
   .badge::before { content: "★ "; }
+  .tiles { display: grid; grid-template-columns: repeat(4, 130px); line-height: 0; margin: 14px 0; }
+  .tiles img { display: block; width: 130px; height: 96px; }
+  .thumbs img { display: inline-block; width: 40px; height: 40px; margin: 0; vertical-align: top; }
   code { background: #eee; padding: 1px 4px; }
 </style>
 </head>
@@ -36,6 +39,10 @@
   <canvas id="cv" width="140" height="120"></canvas>
 </div>
 
+<p>A gallery with no gaps between images:</p>
+<div class="tiles"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%232c3e50'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%2316a085'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%23c0392b'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%238e44ad'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%23d35400'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%2327ae60'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%232980b9'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%237f8c8d'/%3E%3C/svg%3E"></div>
+<p>Touching thumbnails:</p>
+<div class="thumbs"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%2334495e'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%23e74c3c'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%231abc9c'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%23f39c12'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%239b59b6'/%3E%3C/svg%3E"><img alt="tile" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='192'%3E%3Crect width='260' height='192' fill='%232ecc71'/%3E%3C/svg%3E"></div>
 <table>
   <tr><th>Region</th><th>Sales</th></tr>
   <tr><td>North</td><td>19,204</td></tr>
@@ -64,6 +71,47 @@
     d.textContent = 'Dynamically added paragraph number 9876';
     document.body.appendChild(d);
   }, 400);
+</script>
+<!-- Stand-in for the userscript manager: localStorage-backed GM storage and a
+     panel that renders the script's menu commands the way the extension popup does. -->
+<script>
+(function () {
+  var menu = [], nextId = 1, listeners = [], host = null;
+
+  window.GM_getValue = function (k, d) {
+    var v = localStorage.getItem('gm:' + k);
+    return v === null ? d : JSON.parse(v);
+  };
+  window.GM_setValue = function (k, v) {
+    localStorage.setItem('gm:' + k, JSON.stringify(v));
+    listeners.forEach(function (l) { if (l[0] === k) l[1](k, undefined, v, false); });
+  };
+  window.GM_addValueChangeListener = function (k, fn) { listeners.push([k, fn]); return listeners.length; };
+  window.GM_registerMenuCommand = function (label, fn) {
+    var id = nextId++; menu.push({ id: id, label: label, fn: fn }); render(); return id;
+  };
+  window.GM_unregisterMenuCommand = function (id) {
+    menu = menu.filter(function (m) { return m.id !== id; }); render();
+  };
+
+  function render() {
+    if (!host) {
+      host = document.createElement('div');
+      host.setAttribute('data-censor-skip', '');
+      host.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;display:flex;' +
+        'gap:6px;flex-direction:column;font:12px system-ui,sans-serif';
+      (document.body || document.documentElement).appendChild(host);
+    }
+    host.textContent = '';
+    menu.forEach(function (m) {
+      var b = document.createElement('button');
+      b.textContent = m.label;
+      b.style.cssText = 'padding:6px 10px;cursor:pointer';
+      b.onclick = m.fn;
+      host.appendChild(b);
+    });
+  }
+})();
 </script>
 <script src="total-censor.user.js"></script>
 </body>
